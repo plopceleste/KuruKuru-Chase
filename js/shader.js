@@ -24,9 +24,14 @@ float hardPix=-4.5;
 vec2 warp=vec2(1.0/100.0,1.0/100.0);
 float maskDark=0.85;
 float maskLight=1.15;
+float scanDepth=0.18;
+
+// Thinnest scanline worth drawing, in device pixels. Below roughly two the
+// pattern cannot be rendered at all, so the tube drops to one scanline per two
+// signal rows, then three, rather than fading the effect out.
+const float MIN_SCAN=2.0;
 
 const float LOG2=0.69314718;
-const float PI=3.14159265;
 
 float ToLinear1(float c){return(c<=0.04045)?c/12.92:pow((c+0.055)/1.055,2.4);}
 vec3 ToLinear(vec3 c){return vec3(ToLinear1(c.r),ToLinear1(c.g),ToLinear1(c.b));}
@@ -45,10 +50,20 @@ float Band(float hard,float fp){
   float v=-1.0/(2.0*LOG2*hard)+fp*fp*(1.0/12.0);
   return -1.0/(2.0*LOG2*v);}
 
-// Integral of exp2(s*x*x). Dividing the scanline weights by it holds average
-// brightness fixed however wide the beam gets, so the scanlines shallow out
-// gracefully instead of washing the picture brighter as they fade.
-float GausNorm(float scale){return sqrt(PI/(-scale*LOG2));}
+// Scanlines, locked to the signal grid so they ride the warp with the picture
+// rather than sliding across it. The period is a whole number of signal rows,
+// widened until it clears MIN_SCAN device pixels: one line per row where the
+// display has room, one per two rows or three where it does not.
+//
+// This is deliberately not folded into the beam reconstruction below. Driving
+// the scanlines off the 360-row grid meant a window shorter than ~720 device
+// pixels had under a pixel per row, and band-limiting then flattened the whole
+// effect to nothing -- turning the shader on changed the picture by about 2%,
+// which reads as the toggle being broken. The cosine averages to one, so depth
+// costs no brightness.
+float Scanlines(vec2 pos,vec2 r){
+  float rows=max(1.0,ceil(MIN_SCAN/(iResolution.y/r.y)));
+  return 1.0+scanDepth*cos(6.28318531*(pos.y*r.y/rows));}
 
 vec3 Fetch(vec2 pos,vec2 off,vec2 r){
   // Sample the centre of the emulated pixel. The old edge-snapped
@@ -87,21 +102,21 @@ vec3 Horz5(vec2 pos,float off,vec2 r,float scale){
   float we=Gaus(dst+2.0,scale);
   return (a*wa+b*wb+c*wc+d*wd+e*we)/(wa+wb+wc+wd+we);}
 
-float Scan(vec2 pos,float off,vec2 r,float scale,float norm){
-  float dst=Dist(pos,r).y;
-  return Gaus(dst+off,scale)/norm;}
-
+// Beam reconstruction: three signal rows through the vertical spot, each row
+// resolved horizontally through Horz3/Horz5. Normalised by the weight sum, so
+// this is purely a resampling filter -- brightness in equals brightness out,
+// and the scanline shaping is applied separately above.
 vec3 Tri(vec2 pos,vec2 r,vec2 fp){
   float sx=Band(hardPix,fp.x);
   float sy=Band(hardScan,fp.y);
-  float norm=GausNorm(sy);
   vec3 a=Horz3(pos,-1.0,r,sx);
   vec3 b=Horz5(pos, 0.0,r,sx);
   vec3 c=Horz3(pos, 1.0,r,sx);
-  float wa=Scan(pos,-1.0,r,sy,norm);
-  float wb=Scan(pos, 0.0,r,sy,norm);
-  float wc=Scan(pos, 1.0,r,sy,norm);
-  return a*wa+b*wb+c*wc;}
+  float dst=Dist(pos,r).y;
+  float wa=Gaus(dst-1.0,sy);
+  float wb=Gaus(dst+0.0,sy);
+  float wc=Gaus(dst+1.0,sy);
+  return (a*wa+b*wb+c*wc)/(wa+wb+wc);}
 
 vec2 Warp(vec2 pos){
   pos=pos*2.0-1.0;
@@ -127,8 +142,10 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ){
   vec2 uv=fragCoord.xy/iResolution.xy;
   vec2 r=max(res,vec2(1.0,1.0));
   vec2 fp=r/iResolution.xy;              // one output pixel, in emulated pixels
+  vec2 pos=Warp(uv);
   float maskAmt=smoothstep(2.0,3.0,1.0/fp.x);
-  fragColor=vec4(ToSrgb(Tri(Warp(uv),r,fp)*Mask(fragCoord.xy,r,maskAmt)),1.0);}
+  vec3 col=Tri(pos,r,fp)*Scanlines(pos,r)*Mask(fragCoord.xy,r,maskAmt);
+  fragColor=vec4(ToSrgb(col),1.0);}
 `
 };
 
