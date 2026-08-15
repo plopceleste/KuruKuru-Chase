@@ -36,6 +36,15 @@ const w = Math.round(VIRTUAL_W * s), h = Math.round(VIRTUAL_H * s);
 return {x: Math.round((W - w) / 2), y: Math.round((H - h) / 2), w, h, scale: s};
 }
 window.viewFit = viewFit;
+// The true resolution of the emulated display: the world is resolved down to
+// this grid once, and the CRT shader treats one texel of it as one phosphor
+// cell. It is a fixed property of the virtual machine we are pretending to be,
+// not of the browser window -- deriving it from the window (the shader's old
+// iResolution/3) let it drift with window size and device pixel ratio.
+const SIGNAL_W = 640;
+const SIGNAL_H = 360;
+window.SIGNAL_W = SIGNAL_W;
+window.SIGNAL_H = SIGNAL_H;
 ctx.imageSmoothingEnabled = false;
 window.addEventListener('load', resizeCanvas);
 window.addEventListener('resize', resizeCanvas);
