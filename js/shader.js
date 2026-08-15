@@ -3,9 +3,10 @@ const SHADERS = {};
 SHADERS.lottes = {
 name: 'lottes',
 source: `
-// The resolution of the signal this tube is displaying. Channel 0 is the world
-// resolved to exactly this grid beforehand, so one texel is one phosphor cell
-// and every fetch below lands dead centre on a texel.
+// The resolution of the signal this tube is displaying. Channel 0 is the whole
+// picture -- world and UI both -- resolved to exactly this grid beforehand, so
+// one texel is one phosphor cell and every fetch below lands dead centre on a
+// texel. Nothing bypasses the glass.
 //
 // This used to be iResolution.xy/3.0 -- a third of the *window*. That tied the
 // emulated grid to the browser window and the device pixel ratio rather than to
@@ -15,8 +16,11 @@ source: `
 // whole art pixels on the floor. That is what crushed the image.
 #define res (iSignalRes)
 
-float hardScan=-8.0;
-float hardPix=-6.0;
+// Beam tuning, in emulated pixels. Halfway between a soft, bloomy tube (-4/-3,
+// which smears pixel art) and a hard one (-10/-8, which is so tight the
+// scanlines read as a stencil laid over the picture).
+float hardScan=-6.0;
+float hardPix=-4.5;
 vec2 warp=vec2(1.0/100.0,1.0/100.0);
 float maskDark=0.85;
 float maskLight=1.15;
@@ -124,9 +128,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ){
   vec2 r=max(res,vec2(1.0,1.0));
   vec2 fp=r/iResolution.xy;              // one output pixel, in emulated pixels
   float maskAmt=smoothstep(2.0,3.0,1.0/fp.x);
-  vec3 worldCol=ToSrgb(Tri(Warp(uv),r,fp)*Mask(fragCoord.xy,r,maskAmt));
-  vec4 ui=texture(iChannel1,uv);
-  fragColor=vec4(mix(worldCol,ui.rgb,ui.a),1.0);}
+  fragColor=vec4(ToSrgb(Tri(Warp(uv),r,fp)*Mask(fragCoord.xy,r,maskAmt)),1.0);}
 `
 };
 

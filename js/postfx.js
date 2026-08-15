@@ -14,22 +14,30 @@ vec4 u = texture(iChannel1, uv);
 fragColor = vec4(mix(w.rgb, u.rgb, u.a), 1.0);
 }`;
 
-// Resolves the full-resolution world buffer down to the emulated signal grid.
+// Flattens world + UI into the emulated signal grid. Everything the tube shows
+// goes through here, so the UI is part of the signal rather than something
+// pasted on after the glass.
+//
 // Each output texel is an area average of the source region it covers -- two
 // bilinear taps per axis approximate that box -- so shrinking the picture loses
 // detail smoothly instead of point-sampling art pixels away. After this the CRT
 // pass reads a buffer whose texels *are* its phosphor cells, so its own
 // sampling is exact by construction (and a lot more cache-friendly).
 const POSTFX_RESOLVE = `
+vec4 layers(vec2 uv) {
+vec4 w = texture(iChannel0, uv);
+vec4 u = texture(iChannel1, uv);
+return vec4(mix(w.rgb, u.rgb, u.a), 1.0);
+}
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 vec2 src = iChannelResolution[0].xy;
 vec2 k = src / iResolution.xy;
 vec2 o = (k * 0.25) / src;
 vec2 uv = fragCoord / iResolution.xy;
-vec4 c = texture(iChannel0, uv + vec2(-o.x, -o.y))
-       + texture(iChannel0, uv + vec2( o.x, -o.y))
-       + texture(iChannel0, uv + vec2(-o.x,  o.y))
-       + texture(iChannel0, uv + vec2( o.x,  o.y));
+vec4 c = layers(uv + vec2(-o.x, -o.y))
+       + layers(uv + vec2( o.x, -o.y))
+       + layers(uv + vec2(-o.x,  o.y))
+       + layers(uv + vec2( o.x,  o.y));
 fragColor = c * 0.25;
 }`;
 
@@ -184,6 +192,9 @@ gl.useProgram(r.prog);
 gl.activeTexture(gl.TEXTURE0);
 gl.bindTexture(gl.TEXTURE_2D, this.tex);
 if (r.uChan0) gl.uniform1i(r.uChan0, 0);
+gl.activeTexture(gl.TEXTURE1);
+gl.bindTexture(gl.TEXTURE_2D, this.texUI);
+if (r.uChan1) gl.uniform1i(r.uChan1, 1);
 if (r.uRes) gl.uniform3f(r.uRes, SIGNAL_W, SIGNAL_H, 1.0);
 if (r.uChanRes) {
 const cr = this.chanRes;
@@ -197,14 +208,19 @@ return true;
 render() {
 if (!this.ok || !this.gl) return false;
 const gl = this.gl;
-const e = (this.passthrough || !this.user) ? this.identity : this.user;
+let e = (this.passthrough || !this.user) ? this.identity : this.user;
 if (!e) return false;
 const fit = viewFit();
 gl.activeTexture(gl.TEXTURE0);
 this.upload(this.tex, this.texSize, this.source);
+gl.activeTexture(gl.TEXTURE1);
+this.upload(this.texUI, this.texUISize, this.uiSource);
 // Only the emulating shaders want the resolved signal; pass-through and the
-// plain identity blit stay on the full-resolution world buffer.
+// plain identity blit stay on the full-resolution buffers.
 const signal = (this.useSignal && !this.passthrough) ? this.renderSignal() : false;
+// The emulating shaders read their UI out of the signal buffer, so without one
+// they would drop the UI entirely -- blit instead.
+if (this.useSignal && !this.passthrough && !signal) e = this.identity;
 gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 gl.clearColor(0, 0, 0, 1);
 gl.clear(gl.COLOR_BUFFER_BIT);
@@ -214,8 +230,6 @@ gl.useProgram(e.prog);
 gl.activeTexture(gl.TEXTURE0);
 gl.bindTexture(gl.TEXTURE_2D, signal ? this.signalTex : this.tex);
 gl.uniform1i(e.uChan0, 0);
-gl.activeTexture(gl.TEXTURE1);
-this.upload(this.texUI, this.texUISize, this.uiSource);
 if (e.uChan1) gl.uniform1i(e.uChan1, 1);
 if (e.uRes) gl.uniform3f(e.uRes, w, h, 1.0);
 if (e.uSignal) gl.uniform2f(e.uSignal, SIGNAL_W, SIGNAL_H);
