@@ -6,7 +6,11 @@ window.postfx = postfx;
 const display2d = postfx.ok ? null : displayCanvas.getContext('2d', {alpha: false});
 
 function present() {
-postfx.passthrough = (game.screen === 'loading');
+// Bypass the shader while assets are still being built, but not once the boot
+// screen has finished and is sitting there waiting on a tap. That screen keeps
+// the 'loading' name, so bypassing on the name alone left the shader visibly
+// dead on the first -- and often only -- screen anyone looks at.
+postfx.passthrough = (game.screen === 'loading' && game.loadProgress < 1);
 if (postfx.ok && postfx.render()) return;
 if (display2d) {
 const fit = viewFit();
