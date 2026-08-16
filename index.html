@@ -103,17 +103,47 @@
         font-size: 0.85em;
       }
 
+      /* Square so the phone still fits its box on the upright half of the turn. */
+      #rotate-phone-box {
+        width: clamp(120px, 44vw, 180px);
+        height: clamp(120px, 44vw, 180px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
       #rotate-phone {
-        width: clamp(96px, 40vw, 160px);
-        aspect-ratio: 16 / 9;
-        border: 0.35rem solid var(--ui-color);
-        background: var(--accent-color);
-        animation: rotate-blink 1s steps(1, end) infinite;
+        width: 100%;
+        height: auto;
+        /* Snap between upright and sideways rather than sweeping through it:
+           a phone caught at 37 degrees is a pile of antialiased diagonals. */
+        animation: rotate-turn 1.6s steps(1, end) infinite;
+      }
+
+      @keyframes rotate-turn {
+        /* Anticlockwise: the home button is on the left short edge, so it has
+           to swing down to the bottom. Turning the other way stands the phone
+           on its head. */
+        0% {
+          transform: rotate(-90deg);
+        }
+        50%,
+        100% {
+          transform: rotate(0deg);
+        }
+      }
+
+      #rotate-screen {
+        animation: rotate-blink 1.6s steps(1, end) infinite;
       }
 
       @keyframes rotate-blink {
-        50% {
-          background: #3a4466;
+        0% {
+          fill: #3a4466;
+        }
+        50%,
+        100% {
+          fill: var(--accent-color);
         }
       }
 
@@ -128,7 +158,8 @@
       }
 
       @media (prefers-reduced-motion: reduce) {
-        #rotate-phone {
+        #rotate-phone,
+        #rotate-screen {
           animation: none;
         }
       }
@@ -144,7 +175,21 @@
     </div>
 
     <div id="rotate" aria-hidden="true">
-      <div id="rotate-phone"></div>
+      <div id="rotate-phone-box">
+        <!-- Drawn on a 44x24 grid so every edge lands on a whole unit, and
+             rendered with crispEdges so scaling it never softens one. -->
+        <svg id="rotate-phone" viewBox="0 0 44 24" shape-rendering="crispEdges" role="presentation" focusable="false">
+          <!-- Chassis: two overlapping rects give stepped corners, the pixel
+               art equivalent of a corner radius. -->
+          <rect x="2" y="0" width="40" height="24" fill="var(--ui-color)" />
+          <rect x="0" y="2" width="44" height="20" fill="var(--ui-color)" />
+          <rect id="rotate-screen" x="7" y="3" width="30" height="18" fill="var(--accent-color)" />
+          <!-- Home button on one short edge, earpiece and camera on the other. -->
+          <rect x="2" y="11" width="3" height="3" fill="var(--bg-color)" />
+          <rect x="39" y="9" width="2" height="7" fill="var(--bg-color)" />
+          <rect x="39" y="6" width="2" height="2" fill="var(--bg-color)" />
+        </svg>
+      </div>
       <p>rotate your device</p>
       <p class="sub">hold it sideways</p>
     </div>
@@ -157,7 +202,6 @@
         const VIEW_H = 810;
         const SIGNAL_W = 640;
         const SIGNAL_H = 360;
-
         const TILE = 18;
         const MAZE_W = 19;
         const MAZE_H = 19;
@@ -1896,18 +1940,112 @@ void main ()
           }
         }
 
+        // Everything lands on whole pixels. A fractional edge gets antialiased
+        // into a half-shade row, and the nearest-neighbour upscale then blows
+        // that row up into a visible soft band along the shape.
         function fillRect(x, y, w, h, color, alpha) {
           const previous = ctx.globalAlpha;
           if (alpha !== undefined) ctx.globalAlpha = previous * alpha;
           ctx.fillStyle = color;
-          ctx.fillRect(x, y, w, h);
+          ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
           ctx.globalAlpha = previous;
         }
 
         function strokeRect(x, y, w, h, color, width = 2) {
           ctx.strokeStyle = color;
-          ctx.lineWidth = width;
-          ctx.strokeRect(x, y, w, h);
+          ctx.lineWidth = Math.max(1, Math.round(width));
+          ctx.strokeRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+        }
+
+        const COLOR_PROBE = document.createElement('canvas').getContext('2d');
+        const COLOR_CACHE = new Map();
+
+        // Normalises any CSS colour the palette or a theme hands us down to
+        // three channels, by letting the canvas itself do the parsing.
+        function resolveColor(color) {
+          const cached = COLOR_CACHE.get(color);
+          if (cached) return cached;
+
+          COLOR_PROBE.fillStyle = '#000000';
+          COLOR_PROBE.fillStyle = color;
+          const value = COLOR_PROBE.fillStyle;
+
+          let rgb;
+          if (value.charAt(0) === '#') {
+            rgb = [
+              parseInt(value.slice(1, 3), 16),
+              parseInt(value.slice(3, 5), 16),
+              parseInt(value.slice(5, 7), 16)
+            ];
+          } else {
+            const parts = value.match(/[\d.]+/g) || ['255', '255', '255'];
+            rgb = [Number(parts[0]), Number(parts[1]), Number(parts[2])];
+          }
+
+          COLOR_CACHE.set(color, rgb);
+          return rgb;
+        }
+
+        const TEXT_PANELS = new Map();
+        const TEXT_PAD = 4;
+        const TEXT_CUTOFF = 128;
+
+        // The browser antialiases glyph edges, and on most machines it does it
+        // with subpixel rendering, so every vertical stem picks up a coloured
+        // fringe. Upscaling turns each fringe into a fat blurry bar against
+        // otherwise hard-edged art. Rendering a string once and thresholding
+        // its coverage to 1-bit gives back real pixel letters.
+        function textPanel(content, size, color) {
+          const key = `${content}|${size}|${color}`;
+          const cached = TEXT_PANELS.get(key);
+          if (cached) return cached;
+
+          const canvas = document.createElement('canvas');
+          const target = canvas.getContext('2d', {willReadFrequently: true});
+
+          target.font = `${size}px ${FONT}`;
+          const textWidth = Math.max(1, Math.ceil(target.measureText(content).width));
+
+          // Resizing clears the context, so every setting is applied after.
+          canvas.width = textWidth + TEXT_PAD * 2;
+          canvas.height = Math.ceil(size * 2) + TEXT_PAD * 2;
+          target.font = `${size}px ${FONT}`;
+          target.textAlign = 'left';
+          target.textBaseline = 'middle';
+          target.imageSmoothingEnabled = false;
+          target.fillStyle = '#ffffff';
+          target.fillText(content, TEXT_PAD, canvas.height / 2);
+
+          const rgb = resolveColor(color);
+          const image = target.getImageData(0, 0, canvas.width, canvas.height);
+          const data = image.data;
+          for (let i = 0; i < data.length; i += 4) {
+            const lit = data[i + 3] >= TEXT_CUTOFF;
+            data[i] = rgb[0];
+            data[i + 1] = rgb[1];
+            data[i + 2] = rgb[2];
+            data[i + 3] = lit ? 255 : 0;
+          }
+          target.putImageData(image, 0, 0);
+
+          const panel = {canvas, textWidth};
+          if (TEXT_PANELS.size > 512) TEXT_PANELS.clear();
+          TEXT_PANELS.set(key, panel);
+          return panel;
+        }
+
+        // Draws thresholded text with the same anchoring fillText gave us:
+        // originX 0 left, 0.5 centred, 1 right, y at the vertical middle.
+        function drawText(target, x, y, content, size, color, originX = 0.5) {
+          const text = String(content);
+          if (!text) return;
+
+          const panel = textPanel(text, Math.max(1, Math.round(size)), color);
+          target.drawImage(
+            panel.canvas,
+            Math.round(x - panel.textWidth * originX) - TEXT_PAD,
+            Math.round(y - panel.canvas.height / 2)
+          );
         }
 
         function measure(content, size) {
@@ -1925,11 +2063,7 @@ void main ()
           const requested = options.size || F;
           const size = options.maxWidth ? fitSize(content, requested, options.maxWidth) : Math.round(requested);
           const originX = options.originX ?? 0.5;
-          ctx.font = `${size}px ${FONT}`;
-          ctx.fillStyle = options.color || PALETTE.paper;
-          ctx.textAlign = originX === 0 ? 'left' : originX === 1 ? 'right' : 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(content, Math.round(x), Math.round(y));
+          drawText(ctx, x, y, content, size, options.color || PALETTE.paper, originX);
         }
 
         function drawSprite(tex, name, x, y) {
@@ -2271,13 +2405,9 @@ void main ()
           target.strokeStyle = colors.ui;
           target.lineWidth = 5;
           target.strokeRect(0, 0, CARD_IMAGE_W, CARD_IMAGE_H);
-          target.textAlign = 'center';
 
-          target.font = `22px ${FONT}`;
-          target.fillStyle = colors.accent;
-          target.fillText('KuruKuru Chase!!', CARD_IMAGE_W / 2, 60);
+          drawText(target, CARD_IMAGE_W / 2, 60, 'KuruKuru Chase!!', 22, colors.accent);
 
-          target.font = `16px ${FONT}`;
           const lines = [
             [`score: ${run.bank}`, colors.ui, 130],
             [`floor: ${run.floor}`, colors.pellet, 180],
@@ -2285,17 +2415,16 @@ void main ()
             [`best streak: ${run.bestStreak}`, colors.text, 280]
           ];
           for (const [text, color, y] of lines) {
-            target.fillStyle = color;
-            target.fillText(text, CARD_IMAGE_W / 2, y);
+            drawText(target, CARD_IMAGE_W / 2, y, text, 16, color);
           }
 
-          target.font = `11px ${FONT}`;
-          target.fillStyle = PALETTE.dim;
-          target.fillText(`seed: ${run.seed}`, CARD_IMAGE_W / 2, 350);
+          drawText(target, CARD_IMAGE_W / 2, 350, `seed: ${run.seed}`, 11, PALETTE.dim);
 
+          // PNG, not JPEG: lossy compression puts ringing around every hard
+          // edge, which is the one thing pixel art cannot survive.
           const link = document.createElement('a');
-          link.download = `kurukuru-chase-${Date.now()}.jpg`;
-          link.href = canvas.toDataURL('image/jpeg');
+          link.download = `kurukuru-chase-${Date.now()}.png`;
+          link.href = canvas.toDataURL('image/png');
           link.click();
         }
 
@@ -4297,17 +4426,29 @@ void main ()
           game.scene.pointerMove(point.x, point.y);
         });
 
+        // A finger leaves nothing hovering behind it. The pointer keeps its last
+        // position after a touch ends, so without this the widget under the tap
+        // stays lit, and the next scene's refreshHover lights whatever it built
+        // under those same stale coordinates.
+        const dropHover = () => {
+          pointer.x = -1;
+          pointer.y = -1;
+          if (game.scene) game.scene.refreshHover();
+        };
+
         const releasePointer = (event) => {
           const point = stagePoint(event);
           if (!point || !game.scene) return;
           pointer.id = event.pointerId;
           game.scene.pointerUp(point.x, point.y);
+          if (event.pointerType !== 'mouse') dropHover();
         };
 
         // A cancelled pointer is an aborted gesture, not a tap: routing it
         // through pointerUp would fire the widget click sitting under the finger.
-        const cancelPointer = () => {
+        const cancelPointer = (event) => {
           if (game.scene) game.scene.clearInput();
+          if (!event || event.pointerType !== 'mouse') dropHover();
         };
 
         stage.addEventListener('pointerup', releasePointer);
