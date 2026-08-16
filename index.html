@@ -70,18 +70,6 @@
         image-rendering: pixelated;
       }
 
-      #tube {
-        visibility: hidden;
-      }
-
-      #stage.crt #view {
-        visibility: hidden;
-      }
-
-      #stage.crt #tube {
-        visibility: visible;
-      }
-
       #rotate {
         display: none;
         position: fixed;
@@ -103,17 +91,47 @@
         font-size: 0.85em;
       }
 
+      /* Square so the phone still fits its box on the upright half of the turn. */
+      #rotate-phone-box {
+        width: clamp(120px, 44vw, 180px);
+        height: clamp(120px, 44vw, 180px);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
       #rotate-phone {
-        width: clamp(96px, 40vw, 160px);
-        aspect-ratio: 16 / 9;
-        border: 0.35rem solid var(--ui-color);
-        background: var(--accent-color);
-        animation: rotate-blink 1s steps(1, end) infinite;
+        width: 100%;
+        height: auto;
+        /* Snap between upright and sideways rather than sweeping through it:
+           a phone caught at 37 degrees is a pile of antialiased diagonals. */
+        animation: rotate-turn 1.6s steps(1, end) infinite;
+      }
+
+      @keyframes rotate-turn {
+        /* Anticlockwise: the home button is on the left short edge, so it has
+           to swing down to the bottom. Turning the other way stands the phone
+           on its head. */
+        0% {
+          transform: rotate(-90deg);
+        }
+        50%,
+        100% {
+          transform: rotate(0deg);
+        }
+      }
+
+      #rotate-screen {
+        animation: rotate-blink 1.6s steps(1, end) infinite;
       }
 
       @keyframes rotate-blink {
-        50% {
-          background: #3a4466;
+        0% {
+          fill: #3a4466;
+        }
+        50%,
+        100% {
+          fill: var(--accent-color);
         }
       }
 
@@ -128,7 +146,8 @@
       }
 
       @media (prefers-reduced-motion: reduce) {
-        #rotate-phone {
+        #rotate-phone,
+        #rotate-screen {
           animation: none;
         }
       }
@@ -139,12 +158,25 @@
     <div id="game">
       <div id="stage">
         <canvas id="view"></canvas>
-        <canvas id="tube"></canvas>
       </div>
     </div>
 
     <div id="rotate" aria-hidden="true">
-      <div id="rotate-phone"></div>
+      <div id="rotate-phone-box">
+        <!-- Drawn on a 44x24 grid so every edge lands on a whole unit, and
+             rendered with crispEdges so scaling it never softens one. -->
+        <svg id="rotate-phone" viewBox="0 0 44 24" shape-rendering="crispEdges" role="presentation" focusable="false">
+          <!-- Chassis: two overlapping rects give stepped corners, the pixel
+               art equivalent of a corner radius. -->
+          <rect x="2" y="0" width="40" height="24" fill="var(--ui-color)" />
+          <rect x="0" y="2" width="44" height="20" fill="var(--ui-color)" />
+          <rect id="rotate-screen" x="7" y="3" width="30" height="18" fill="var(--accent-color)" />
+          <!-- Home button on one short edge, earpiece and camera on the other. -->
+          <rect x="2" y="11" width="3" height="3" fill="var(--bg-color)" />
+          <rect x="39" y="9" width="2" height="7" fill="var(--bg-color)" />
+          <rect x="39" y="6" width="2" height="2" fill="var(--bg-color)" />
+        </svg>
+      </div>
       <p>rotate your device</p>
       <p class="sub">hold it sideways</p>
     </div>
@@ -155,9 +187,6 @@
       (() => {
         const VIEW_W = 1440;
         const VIEW_H = 810;
-        const SIGNAL_W = 640;
-        const SIGNAL_H = 360;
-
         const TILE = 18;
         const MAZE_W = 19;
         const MAZE_H = 19;
@@ -443,9 +472,6 @@
             return value === 30 || value === 60 ? value : 0;
           },
           set fpsLimit(value) { writeStore('Fps', value); },
-
-          get crt() { return readStore('Crt') !== 'off'; },
-          set crt(value) { writeStore('Crt', value ? 'on' : 'off'); }
         };
 
         function clamp(value, min, max) {
@@ -1571,305 +1597,11 @@
         const shell = document.getElementById('game');
         const stage = document.getElementById('stage');
         const view = document.getElementById('view');
-        const tube = document.getElementById('tube');
         const ctx = view.getContext('2d', {alpha: false});
 
         view.width = VIEW_W;
         view.height = VIEW_H;
         ctx.imageSmoothingEnabled = false;
-
-        const QUAD = new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]);
-
-        const CRT_VERT = `
-attribute vec2 aPos;
-varying vec2 outTexCoord;
-
-void main ()
-{
-    outTexCoord = aPos;
-    gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0);
-}
-`;
-
-        const RESOLVE_FRAG = `
-precision highp float;
-
-uniform sampler2D uMainSampler;
-uniform vec2 uSourceRes;
-uniform vec2 uTargetRes;
-
-varying vec2 outTexCoord;
-
-void main ()
-{
-    vec2 spread = (uSourceRes / uTargetRes / 3.0) / uSourceRes;
-
-    vec3 sum = vec3(0.0);
-    for (int y = -1; y <= 1; y++)
-    {
-        for (int x = -1; x <= 1; x++)
-        {
-            sum += texture2D(uMainSampler, outTexCoord + vec2(float(x), float(y)) * spread).rgb;
-        }
-    }
-
-    gl_FragColor = vec4(sum / 9.0, 1.0);
-}
-`;
-
-        const CRT_FRAG = `
-precision highp float;
-
-uniform sampler2D uMainSampler;
-uniform vec2 uSignalRes;
-uniform vec2 uOutputRes;
-
-varying vec2 outTexCoord;
-
-const float hardScan = -6.0;
-const float hardPix = -4.5;
-const vec2 warp = vec2(1.0 / 100.0, 1.0 / 100.0);
-const float maskDark = 0.85;
-const float maskLight = 1.15;
-const float scanDepth = 0.18;
-const float MIN_SCAN = 2.0;
-const float LOG2 = 0.69314718;
-
-float ToLinear1 (float c) { return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
-vec3 ToLinear (vec3 c) { return vec3(ToLinear1(c.r), ToLinear1(c.g), ToLinear1(c.b)); }
-
-float ToSrgb1 (float c) { return (c < 0.0031308) ? c * 12.92 : 1.055 * pow(c, 0.41666) - 0.055; }
-vec3 ToSrgb (vec3 c) { return vec3(ToSrgb1(c.r), ToSrgb1(c.g), ToSrgb1(c.b)); }
-
-float Band (float hard, float fp)
-{
-    float v = -1.0 / (2.0 * LOG2 * hard) + fp * fp * (1.0 / 12.0);
-    return -1.0 / (2.0 * LOG2 * v);
-}
-
-float Scanlines (vec2 pos, vec2 r)
-{
-    float rows = max(1.0, ceil(MIN_SCAN / (uOutputRes.y / r.y)));
-    return 1.0 + scanDepth * cos(6.28318531 * (pos.y * r.y / rows));
-}
-
-vec3 Fetch (vec2 pos, vec2 off, vec2 r)
-{
-    pos = (floor(pos * r + off) + 0.5) / r;
-    if (max(abs(pos.x - 0.5), abs(pos.y - 0.5)) > 0.5) return vec3(0.0);
-    return ToLinear(texture2D(uMainSampler, pos).rgb);
-}
-
-vec2 Dist (vec2 pos, vec2 r) { pos = pos * r; return -((pos - floor(pos)) - vec2(0.5)); }
-
-float Gaus (float pos, float scale) { return exp2(scale * pos * pos); }
-
-vec3 Horz3 (vec2 pos, float off, vec2 r, float scale)
-{
-    vec3 b = Fetch(pos, vec2(-1.0, off), r);
-    vec3 c = Fetch(pos, vec2(0.0, off), r);
-    vec3 d = Fetch(pos, vec2(1.0, off), r);
-    float dst = Dist(pos, r).x;
-    float wb = Gaus(dst - 1.0, scale);
-    float wc = Gaus(dst, scale);
-    float wd = Gaus(dst + 1.0, scale);
-    return (b * wb + c * wc + d * wd) / (wb + wc + wd);
-}
-
-vec3 Horz5 (vec2 pos, float off, vec2 r, float scale)
-{
-    vec3 a = Fetch(pos, vec2(-2.0, off), r);
-    vec3 b = Fetch(pos, vec2(-1.0, off), r);
-    vec3 c = Fetch(pos, vec2(0.0, off), r);
-    vec3 d = Fetch(pos, vec2(1.0, off), r);
-    vec3 e = Fetch(pos, vec2(2.0, off), r);
-    float dst = Dist(pos, r).x;
-    float wa = Gaus(dst - 2.0, scale);
-    float wb = Gaus(dst - 1.0, scale);
-    float wc = Gaus(dst, scale);
-    float wd = Gaus(dst + 1.0, scale);
-    float we = Gaus(dst + 2.0, scale);
-    return (a * wa + b * wb + c * wc + d * wd + e * we) / (wa + wb + wc + wd + we);
-}
-
-vec3 Tri (vec2 pos, vec2 r, vec2 fp)
-{
-    float sx = Band(hardPix, fp.x);
-    float sy = Band(hardScan, fp.y);
-    vec3 a = Horz3(pos, -1.0, r, sx);
-    vec3 b = Horz5(pos, 0.0, r, sx);
-    vec3 c = Horz3(pos, 1.0, r, sx);
-    float dst = Dist(pos, r).y;
-    float wa = Gaus(dst - 1.0, sy);
-    float wb = Gaus(dst, sy);
-    float wc = Gaus(dst + 1.0, sy);
-    return (a * wa + b * wb + c * wc) / (wa + wb + wc);
-}
-
-vec2 Warp (vec2 pos)
-{
-    pos = pos * 2.0 - 1.0;
-    pos *= vec2(1.0 + (pos.y * pos.y) * warp.x, 1.0 + (pos.x * pos.x) * warp.y);
-    return pos * 0.5 + 0.5;
-}
-
-vec3 Mask (vec2 fragCoord, vec2 r, float amount)
-{
-    vec2 e = fragCoord * (r / uOutputRes);
-    float x = fract(e.x + floor(e.y) * 0.5);
-    vec3 mask = vec3(maskDark);
-    if (x < 0.333) mask.r = maskLight;
-    else if (x < 0.666) mask.g = maskLight;
-    else mask.b = maskLight;
-    return mix(vec3(1.0), mask, amount);
-}
-
-void main ()
-{
-    vec2 r = max(uSignalRes, vec2(1.0));
-    vec2 fp = r / uOutputRes;
-    vec2 pos = Warp(outTexCoord);
-    float maskAmount = smoothstep(2.0, 3.0, 1.0 / fp.x);
-    vec3 col = Tri(pos, r, fp) * Scanlines(pos, r) * Mask(outTexCoord * uOutputRes, r, maskAmount);
-    gl_FragColor = vec4(ToSrgb(col), 1.0);
-}
-`;
-
-        const crt = {
-          gl: null,
-          ready: false,
-          enabled: false,
-          resolve: null,
-          tube: null,
-          source: null,
-          signal: null,
-          buffer: null
-        };
-
-        function compileShader(gl, type, source) {
-          const shader = gl.createShader(type);
-          gl.shaderSource(shader, source);
-          gl.compileShader(shader);
-          if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-            gl.deleteShader(shader);
-            return null;
-          }
-          return shader;
-        }
-
-        function buildProgram(gl, fragSource, uniforms) {
-          const vert = compileShader(gl, gl.VERTEX_SHADER, CRT_VERT);
-          const frag = compileShader(gl, gl.FRAGMENT_SHADER, fragSource);
-          if (!vert || !frag) return null;
-
-          const program = gl.createProgram();
-          gl.attachShader(program, vert);
-          gl.attachShader(program, frag);
-          gl.linkProgram(program);
-          if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
-
-          const handle = {program, position: gl.getAttribLocation(program, 'aPos')};
-          for (const name of uniforms) handle[name] = gl.getUniformLocation(program, name);
-          return handle;
-        }
-
-        function createTexture(gl, width, height, pixels) {
-          const texture = gl.createTexture();
-          gl.bindTexture(gl.TEXTURE_2D, texture);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels || null);
-          return texture;
-        }
-
-        function initCrt() {
-          const options = {alpha: false, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false};
-          const gl = tube.getContext('webgl', options) || tube.getContext('experimental-webgl', options);
-          if (!gl) return;
-
-          const resolve = buildProgram(gl, RESOLVE_FRAG, ['uMainSampler', 'uSourceRes', 'uTargetRes']);
-          const glass = buildProgram(gl, CRT_FRAG, ['uMainSampler', 'uSignalRes', 'uOutputRes']);
-          if (!resolve || !glass) return;
-
-          const quad = gl.createBuffer();
-          gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-          gl.bufferData(gl.ARRAY_BUFFER, QUAD, gl.STATIC_DRAW);
-
-          const source = createTexture(gl, VIEW_W, VIEW_H, null);
-          const signal = createTexture(gl, SIGNAL_W, SIGNAL_H, null);
-
-          const buffer = gl.createFramebuffer();
-          gl.bindFramebuffer(gl.FRAMEBUFFER, buffer);
-          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, signal, 0);
-          const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-          if (!complete) return;
-
-          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-          gl.disable(gl.DEPTH_TEST);
-          gl.disable(gl.BLEND);
-
-          crt.gl = gl;
-          crt.resolve = resolve;
-          crt.tube = glass;
-          crt.source = source;
-          crt.signal = signal;
-          crt.buffer = buffer;
-          crt.quad = quad;
-          crt.ready = true;
-        }
-
-        function drawQuad(gl, handle) {
-          gl.bindBuffer(gl.ARRAY_BUFFER, crt.quad);
-          gl.enableVertexAttribArray(handle.position);
-          gl.vertexAttribPointer(handle.position, 2, gl.FLOAT, false, 0, 0);
-          gl.drawArrays(gl.TRIANGLES, 0, 6);
-        }
-
-        function presentCrt() {
-          const gl = crt.gl;
-          if (gl.isContextLost()) return;
-
-          gl.bindTexture(gl.TEXTURE_2D, crt.source);
-          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, view);
-
-          gl.bindFramebuffer(gl.FRAMEBUFFER, crt.buffer);
-          gl.viewport(0, 0, SIGNAL_W, SIGNAL_H);
-          gl.useProgram(crt.resolve.program);
-          gl.uniform1i(crt.resolve.uMainSampler, 0);
-          gl.uniform2f(crt.resolve.uSourceRes, VIEW_W, VIEW_H);
-          gl.uniform2f(crt.resolve.uTargetRes, SIGNAL_W, SIGNAL_H);
-          drawQuad(gl, crt.resolve);
-
-          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-          gl.bindTexture(gl.TEXTURE_2D, crt.signal);
-          gl.viewport(0, 0, tube.width, tube.height);
-          gl.useProgram(crt.tube.program);
-          gl.uniform1i(crt.tube.uMainSampler, 0);
-          gl.uniform2f(crt.tube.uSignalRes, SIGNAL_W, SIGNAL_H);
-          gl.uniform2f(crt.tube.uOutputRes, tube.width, tube.height);
-          drawQuad(gl, crt.tube);
-        }
-
-        function setCrt(enabled) {
-          crt.enabled = enabled && crt.ready;
-          stage.classList.toggle('crt', crt.enabled);
-        }
-
-        function watchContextLoss() {
-          tube.addEventListener('webglcontextlost', (event) => {
-            event.preventDefault();
-            crt.ready = false;
-            setCrt(false);
-          });
-
-          tube.addEventListener('webglcontextrestored', () => {
-            initCrt();
-            setCrt(save.crt);
-          });
-        }
 
         let frameInterval = 0;
 
@@ -1886,28 +1618,114 @@ void main ()
 
           stage.style.width = `${width}px`;
           stage.style.height = `${height}px`;
-
-          const ratio = Math.min(window.devicePixelRatio || 1, 2);
-          const pixelW = Math.max(1, Math.round(width * ratio));
-          const pixelH = Math.max(1, Math.round(height * ratio));
-          if (tube.width !== pixelW || tube.height !== pixelH) {
-            tube.width = pixelW;
-            tube.height = pixelH;
-          }
         }
 
+        // Everything lands on whole pixels. A fractional edge gets antialiased
+        // into a half-shade row, and the nearest-neighbour upscale then blows
+        // that row up into a visible soft band along the shape.
         function fillRect(x, y, w, h, color, alpha) {
           const previous = ctx.globalAlpha;
           if (alpha !== undefined) ctx.globalAlpha = previous * alpha;
           ctx.fillStyle = color;
-          ctx.fillRect(x, y, w, h);
+          ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
           ctx.globalAlpha = previous;
         }
 
         function strokeRect(x, y, w, h, color, width = 2) {
           ctx.strokeStyle = color;
-          ctx.lineWidth = width;
-          ctx.strokeRect(x, y, w, h);
+          ctx.lineWidth = Math.max(1, Math.round(width));
+          ctx.strokeRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+        }
+
+        const COLOR_PROBE = document.createElement('canvas').getContext('2d');
+        const COLOR_CACHE = new Map();
+
+        // Normalises any CSS colour the palette or a theme hands us down to
+        // three channels, by letting the canvas itself do the parsing.
+        function resolveColor(color) {
+          const cached = COLOR_CACHE.get(color);
+          if (cached) return cached;
+
+          COLOR_PROBE.fillStyle = '#000000';
+          COLOR_PROBE.fillStyle = color;
+          const value = COLOR_PROBE.fillStyle;
+
+          let rgb;
+          if (value.charAt(0) === '#') {
+            rgb = [
+              parseInt(value.slice(1, 3), 16),
+              parseInt(value.slice(3, 5), 16),
+              parseInt(value.slice(5, 7), 16)
+            ];
+          } else {
+            const parts = value.match(/[\d.]+/g) || ['255', '255', '255'];
+            rgb = [Number(parts[0]), Number(parts[1]), Number(parts[2])];
+          }
+
+          COLOR_CACHE.set(color, rgb);
+          return rgb;
+        }
+
+        const TEXT_PANELS = new Map();
+        const TEXT_PAD = 4;
+        const TEXT_CUTOFF = 128;
+
+        // The browser antialiases glyph edges, and on most machines it does it
+        // with subpixel rendering, so every vertical stem picks up a coloured
+        // fringe. Upscaling turns each fringe into a fat blurry bar against
+        // otherwise hard-edged art. Rendering a string once and thresholding
+        // its coverage to 1-bit gives back real pixel letters.
+        function textPanel(content, size, color) {
+          const key = `${content}|${size}|${color}`;
+          const cached = TEXT_PANELS.get(key);
+          if (cached) return cached;
+
+          const canvas = document.createElement('canvas');
+          const target = canvas.getContext('2d', {willReadFrequently: true});
+
+          target.font = `${size}px ${FONT}`;
+          const textWidth = Math.max(1, Math.ceil(target.measureText(content).width));
+
+          // Resizing clears the context, so every setting is applied after.
+          canvas.width = textWidth + TEXT_PAD * 2;
+          canvas.height = Math.ceil(size * 2) + TEXT_PAD * 2;
+          target.font = `${size}px ${FONT}`;
+          target.textAlign = 'left';
+          target.textBaseline = 'middle';
+          target.imageSmoothingEnabled = false;
+          target.fillStyle = '#ffffff';
+          target.fillText(content, TEXT_PAD, canvas.height / 2);
+
+          const rgb = resolveColor(color);
+          const image = target.getImageData(0, 0, canvas.width, canvas.height);
+          const data = image.data;
+          for (let i = 0; i < data.length; i += 4) {
+            const lit = data[i + 3] >= TEXT_CUTOFF;
+            data[i] = rgb[0];
+            data[i + 1] = rgb[1];
+            data[i + 2] = rgb[2];
+            data[i + 3] = lit ? 255 : 0;
+          }
+          target.putImageData(image, 0, 0);
+
+          const panel = {canvas, textWidth};
+          if (TEXT_PANELS.size > 512) TEXT_PANELS.clear();
+          TEXT_PANELS.set(key, panel);
+          return panel;
+        }
+
+        // Draws thresholded text with the same anchoring fillText gave us:
+        // originX 0 left, 0.5 centred, 1 right, y at the vertical middle.
+        function drawText(target, x, y, content, size, color, originX = 0.5) {
+          const text = String(content);
+          if (!text) return;
+
+          const panel = textPanel(text, Math.max(1, Math.round(size)), color);
+          target.drawImage(
+            panel.canvas,
+            Math.round(x - panel.textWidth * originX) - TEXT_PAD,
+            Math.round(y - panel.canvas.height / 2)
+          );
         }
 
         function measure(content, size) {
@@ -1925,11 +1743,7 @@ void main ()
           const requested = options.size || F;
           const size = options.maxWidth ? fitSize(content, requested, options.maxWidth) : Math.round(requested);
           const originX = options.originX ?? 0.5;
-          ctx.font = `${size}px ${FONT}`;
-          ctx.fillStyle = options.color || PALETTE.paper;
-          ctx.textAlign = originX === 0 ? 'left' : originX === 1 ? 'right' : 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(content, Math.round(x), Math.round(y));
+          drawText(ctx, x, y, content, size, options.color || PALETTE.paper, originX);
         }
 
         function drawSprite(tex, name, x, y) {
@@ -2271,13 +2085,9 @@ void main ()
           target.strokeStyle = colors.ui;
           target.lineWidth = 5;
           target.strokeRect(0, 0, CARD_IMAGE_W, CARD_IMAGE_H);
-          target.textAlign = 'center';
 
-          target.font = `22px ${FONT}`;
-          target.fillStyle = colors.accent;
-          target.fillText('KuruKuru Chase!!', CARD_IMAGE_W / 2, 60);
+          drawText(target, CARD_IMAGE_W / 2, 60, 'KuruKuru Chase!!', 22, colors.accent);
 
-          target.font = `16px ${FONT}`;
           const lines = [
             [`score: ${run.bank}`, colors.ui, 130],
             [`floor: ${run.floor}`, colors.pellet, 180],
@@ -2285,17 +2095,16 @@ void main ()
             [`best streak: ${run.bestStreak}`, colors.text, 280]
           ];
           for (const [text, color, y] of lines) {
-            target.fillStyle = color;
-            target.fillText(text, CARD_IMAGE_W / 2, y);
+            drawText(target, CARD_IMAGE_W / 2, y, text, 16, color);
           }
 
-          target.font = `11px ${FONT}`;
-          target.fillStyle = PALETTE.dim;
-          target.fillText(`seed: ${run.seed}`, CARD_IMAGE_W / 2, 350);
+          drawText(target, CARD_IMAGE_W / 2, 350, `seed: ${run.seed}`, 11, PALETTE.dim);
 
+          // PNG, not JPEG: lossy compression puts ringing around every hard
+          // edge, which is the one thing pixel art cannot survive.
           const link = document.createElement('a');
-          link.download = `kurukuru-chase-${Date.now()}.jpg`;
-          link.href = canvas.toDataURL('image/jpeg');
+          link.download = `kurukuru-chase-${Date.now()}.png`;
+          link.href = canvas.toDataURL('image/png');
           link.click();
         }
 
@@ -3673,7 +3482,7 @@ void main ()
             await this.step('building sprites', 0.55);
             buildTextures(this.colors);
 
-            await this.step('warming the tube', 0.85);
+            await this.step('waking the ghosts', 0.85);
             await this.step('tap start to begin', 1);
 
             if (game.scene === this) this.showStart();
@@ -3691,16 +3500,6 @@ void main ()
               if (isTouchDevice()) goImmersive();
               this.start('Menu');
             }, {active: true});
-
-            this.crtButton = this.button(VIEW_W / 2, this.rows[4], this.crtLabel(), () => {
-              save.crt = !save.crt;
-              setCrt(save.crt);
-              this.crtButton.setLabel(this.crtLabel());
-            }, {dim: !save.crt});
-          }
-
-          crtLabel() {
-            return `crt: ${save.crt ? 'on' : 'off'}`;
           }
 
           render() {
@@ -3947,37 +3746,25 @@ void main ()
             const heights = [
               Math.round(F * 2.1),
               Math.round(F * 1.2), BTN_H,
-              Math.round(F * 1.2), BTN_H,
               BTN_H, BTN_H
             ];
             const rows = layoutColumn(PAD, VIEW_H - PAD, heights);
 
             this.titleY = rows[0];
-            this.crtY = rows[1];
-            this.limitY = rows[3];
-
-            this.crtButton = this.button(VIEW_W / 2, rows[2], this.crtLabel(), () => {
-              save.crt = !save.crt;
-              setCrt(save.crt);
-              this.restart();
-            }, {active: save.crt});
+            this.limitY = rows[1];
 
             const width = (BTN_W - PAD * 2) / 3;
             FRAME_LIMITS.forEach((option, i) => {
               const x = VIEW_W / 2 - BTN_W / 2 + width / 2 + i * (width + PAD);
-              this.button(x, rows[4], option.label, () => {
+              this.button(x, rows[2], option.label, () => {
                 setFrameLimit(option.value);
                 this.restart();
               }, {width, active: save.fpsLimit === option.value});
             });
 
-            this.fullscreenButton = this.button(VIEW_W / 2, rows[5], fullscreenLabel(), toggleFullscreen);
+            this.fullscreenButton = this.button(VIEW_W / 2, rows[3], fullscreenLabel(), toggleFullscreen);
 
-            this.button(VIEW_W / 2, rows[6], 'back', () => this.start('Menu'));
-          }
-
-          crtLabel() {
-            return save.crt ? 'on' : 'off';
+            this.button(VIEW_W / 2, rows[4], 'back', () => this.start('Menu'));
           }
 
           // requestFullscreen resolves after the click handler has returned, so
@@ -3992,7 +3779,6 @@ void main ()
             label(VIEW_W / 2, this.titleY, 'KuruKuru Chase!!', {
               size: F * 2, color: this.colors.text, maxWidth: VIEW_W - PAD * 2
             });
-            label(VIEW_W / 2, this.crtY, 'crt filter', {size: Math.round(F * 0.9), color: PALETTE.dim});
             label(VIEW_W / 2, this.limitY, 'frame limit', {size: Math.round(F * 0.9), color: PALETTE.dim});
 
             this.drawWidgets();
@@ -4238,7 +4024,6 @@ void main ()
           render() {
             if (!this.scene) return;
             this.scene.render();
-            if (crt.enabled) presentCrt();
           }
         };
 
@@ -4297,17 +4082,29 @@ void main ()
           game.scene.pointerMove(point.x, point.y);
         });
 
+        // A finger leaves nothing hovering behind it. The pointer keeps its last
+        // position after a touch ends, so without this the widget under the tap
+        // stays lit, and the next scene's refreshHover lights whatever it built
+        // under those same stale coordinates.
+        const dropHover = () => {
+          pointer.x = -1;
+          pointer.y = -1;
+          if (game.scene) game.scene.refreshHover();
+        };
+
         const releasePointer = (event) => {
           const point = stagePoint(event);
           if (!point || !game.scene) return;
           pointer.id = event.pointerId;
           game.scene.pointerUp(point.x, point.y);
+          if (event.pointerType !== 'mouse') dropHover();
         };
 
         // A cancelled pointer is an aborted gesture, not a tap: routing it
         // through pointerUp would fire the widget click sitting under the finger.
-        const cancelPointer = () => {
+        const cancelPointer = (event) => {
           if (game.scene) game.scene.clearInput();
+          if (!event || event.pointerType !== 'mouse') dropHover();
         };
 
         stage.addEventListener('pointerup', releasePointer);
@@ -4354,9 +4151,6 @@ void main ()
           game.render();
         }
 
-        initCrt();
-        watchContextLoss();
-        setCrt(save.crt);
         setFrameLimit(save.fpsLimit);
         layout();
         game.start('Boot');
