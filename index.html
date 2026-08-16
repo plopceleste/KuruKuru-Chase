@@ -1,30 +1,21 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="description" content="KuruKuru Chase!! - a maze chase roguelite.">
+<meta name="theme-color" content="#181425">
 <title>KuruKuru Chase!!</title>
-<link rel="stylesheet" href="css/font.css">
-<link rel="stylesheet" href="css/styles.css">
+<link rel="stylesheet" href="./css/font.css">
+<link rel="stylesheet" href="./css/styles.css">
 </head>
 <body>
-<div id="gameContainer">
-<canvas id="gameCanvas"></canvas>
+<div id="game"></div>
+<div id="rotate" aria-hidden="true">
+<div id="rotate-phone"></div>
+<p>rotate your device</p>
+<p class="sub">hold it sideways</p>
 </div>
-<script src="js/config.js"></script>
-<script src="js/pool.js"></script>
-<script src="js/sprites.js"></script>
-<script src="js/themes.js"></script>
-<script src="js/rng.js"></script>
-<script src="js/audio.js"></script>
-<script src="js/cards.js"></script>
-<script src="js/pathfinder.js"></script>
-<script src="js/ghost.js"></script>
-<script src="js/ui.js"></script>
-<script src="js/game.js"></script>
-<script src="js/shader.js"></script>
-<script src="js/postfx.js"></script>
-<script src="js/main.js"></script>
+<script type="module" src="./src/main.js"></script>
 </body>
 </html>
