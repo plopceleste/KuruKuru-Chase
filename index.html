@@ -70,6 +70,18 @@
         image-rendering: pixelated;
       }
 
+      #tube {
+        visibility: hidden;
+      }
+
+      #stage.crt #view {
+        visibility: hidden;
+      }
+
+      #stage.crt #tube {
+        visibility: visible;
+      }
+
       #rotate {
         display: none;
         position: fixed;
@@ -158,6 +170,7 @@
     <div id="game">
       <div id="stage">
         <canvas id="view"></canvas>
+        <canvas id="tube"></canvas>
       </div>
     </div>
 
@@ -187,6 +200,8 @@
       (() => {
         const VIEW_W = 1440;
         const VIEW_H = 810;
+        const SIGNAL_W = 640;
+        const SIGNAL_H = 360;
         const TILE = 18;
         const MAZE_W = 19;
         const MAZE_H = 19;
@@ -472,6 +487,9 @@
             return value === 30 || value === 60 ? value : 0;
           },
           set fpsLimit(value) { writeStore('Fps', value); },
+
+          get crt() { return readStore('Crt') !== 'off'; },
+          set crt(value) { writeStore('Crt', value ? 'on' : 'off'); }
         };
 
         function clamp(value, min, max) {
@@ -1597,11 +1615,305 @@
         const shell = document.getElementById('game');
         const stage = document.getElementById('stage');
         const view = document.getElementById('view');
+        const tube = document.getElementById('tube');
         const ctx = view.getContext('2d', {alpha: false});
 
         view.width = VIEW_W;
         view.height = VIEW_H;
         ctx.imageSmoothingEnabled = false;
+
+        const QUAD = new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]);
+
+        const CRT_VERT = `
+attribute vec2 aPos;
+varying vec2 outTexCoord;
+
+void main ()
+{
+    outTexCoord = aPos;
+    gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+        const RESOLVE_FRAG = `
+precision highp float;
+
+uniform sampler2D uMainSampler;
+uniform vec2 uSourceRes;
+uniform vec2 uTargetRes;
+
+varying vec2 outTexCoord;
+
+void main ()
+{
+    vec2 spread = (uSourceRes / uTargetRes / 3.0) / uSourceRes;
+
+    vec3 sum = vec3(0.0);
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            sum += texture2D(uMainSampler, outTexCoord + vec2(float(x), float(y)) * spread).rgb;
+        }
+    }
+
+    gl_FragColor = vec4(sum / 9.0, 1.0);
+}
+`;
+
+        const CRT_FRAG = `
+precision highp float;
+
+uniform sampler2D uMainSampler;
+uniform vec2 uSignalRes;
+uniform vec2 uOutputRes;
+
+varying vec2 outTexCoord;
+
+const float hardScan = -6.0;
+const float hardPix = -4.5;
+const vec2 warp = vec2(1.0 / 100.0, 1.0 / 100.0);
+const float maskDark = 0.85;
+const float maskLight = 1.15;
+const float scanDepth = 0.18;
+const float MIN_SCAN = 2.0;
+const float LOG2 = 0.69314718;
+
+float ToLinear1 (float c) { return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+vec3 ToLinear (vec3 c) { return vec3(ToLinear1(c.r), ToLinear1(c.g), ToLinear1(c.b)); }
+
+float ToSrgb1 (float c) { return (c < 0.0031308) ? c * 12.92 : 1.055 * pow(c, 0.41666) - 0.055; }
+vec3 ToSrgb (vec3 c) { return vec3(ToSrgb1(c.r), ToSrgb1(c.g), ToSrgb1(c.b)); }
+
+float Band (float hard, float fp)
+{
+    float v = -1.0 / (2.0 * LOG2 * hard) + fp * fp * (1.0 / 12.0);
+    return -1.0 / (2.0 * LOG2 * v);
+}
+
+float Scanlines (vec2 pos, vec2 r)
+{
+    float rows = max(1.0, ceil(MIN_SCAN / (uOutputRes.y / r.y)));
+    return 1.0 + scanDepth * cos(6.28318531 * (pos.y * r.y / rows));
+}
+
+vec3 Fetch (vec2 pos, vec2 off, vec2 r)
+{
+    pos = (floor(pos * r + off) + 0.5) / r;
+    if (max(abs(pos.x - 0.5), abs(pos.y - 0.5)) > 0.5) return vec3(0.0);
+    return ToLinear(texture2D(uMainSampler, pos).rgb);
+}
+
+vec2 Dist (vec2 pos, vec2 r) { pos = pos * r; return -((pos - floor(pos)) - vec2(0.5)); }
+
+float Gaus (float pos, float scale) { return exp2(scale * pos * pos); }
+
+vec3 Horz3 (vec2 pos, float off, vec2 r, float scale)
+{
+    vec3 b = Fetch(pos, vec2(-1.0, off), r);
+    vec3 c = Fetch(pos, vec2(0.0, off), r);
+    vec3 d = Fetch(pos, vec2(1.0, off), r);
+    float dst = Dist(pos, r).x;
+    float wb = Gaus(dst - 1.0, scale);
+    float wc = Gaus(dst, scale);
+    float wd = Gaus(dst + 1.0, scale);
+    return (b * wb + c * wc + d * wd) / (wb + wc + wd);
+}
+
+vec3 Horz5 (vec2 pos, float off, vec2 r, float scale)
+{
+    vec3 a = Fetch(pos, vec2(-2.0, off), r);
+    vec3 b = Fetch(pos, vec2(-1.0, off), r);
+    vec3 c = Fetch(pos, vec2(0.0, off), r);
+    vec3 d = Fetch(pos, vec2(1.0, off), r);
+    vec3 e = Fetch(pos, vec2(2.0, off), r);
+    float dst = Dist(pos, r).x;
+    float wa = Gaus(dst - 2.0, scale);
+    float wb = Gaus(dst - 1.0, scale);
+    float wc = Gaus(dst, scale);
+    float wd = Gaus(dst + 1.0, scale);
+    float we = Gaus(dst + 2.0, scale);
+    return (a * wa + b * wb + c * wc + d * wd + e * we) / (wa + wb + wc + wd + we);
+}
+
+vec3 Tri (vec2 pos, vec2 r, vec2 fp)
+{
+    float sx = Band(hardPix, fp.x);
+    float sy = Band(hardScan, fp.y);
+    vec3 a = Horz3(pos, -1.0, r, sx);
+    vec3 b = Horz5(pos, 0.0, r, sx);
+    vec3 c = Horz3(pos, 1.0, r, sx);
+    float dst = Dist(pos, r).y;
+    float wa = Gaus(dst - 1.0, sy);
+    float wb = Gaus(dst, sy);
+    float wc = Gaus(dst + 1.0, sy);
+    return (a * wa + b * wb + c * wc) / (wa + wb + wc);
+}
+
+vec2 Warp (vec2 pos)
+{
+    pos = pos * 2.0 - 1.0;
+    pos *= vec2(1.0 + (pos.y * pos.y) * warp.x, 1.0 + (pos.x * pos.x) * warp.y);
+    return pos * 0.5 + 0.5;
+}
+
+vec3 Mask (vec2 fragCoord, vec2 r, float amount)
+{
+    vec2 e = fragCoord * (r / uOutputRes);
+    float x = fract(e.x + floor(e.y) * 0.5);
+    vec3 mask = vec3(maskDark);
+    if (x < 0.333) mask.r = maskLight;
+    else if (x < 0.666) mask.g = maskLight;
+    else mask.b = maskLight;
+    return mix(vec3(1.0), mask, amount);
+}
+
+void main ()
+{
+    vec2 r = max(uSignalRes, vec2(1.0));
+    vec2 fp = r / uOutputRes;
+    vec2 pos = Warp(outTexCoord);
+    float maskAmount = smoothstep(2.0, 3.0, 1.0 / fp.x);
+    vec3 col = Tri(pos, r, fp) * Scanlines(pos, r) * Mask(outTexCoord * uOutputRes, r, maskAmount);
+    gl_FragColor = vec4(ToSrgb(col), 1.0);
+}
+`;
+
+        const crt = {
+          gl: null,
+          ready: false,
+          enabled: false,
+          resolve: null,
+          tube: null,
+          source: null,
+          signal: null,
+          buffer: null
+        };
+
+        function compileShader(gl, type, source) {
+          const shader = gl.createShader(type);
+          gl.shaderSource(shader, source);
+          gl.compileShader(shader);
+          if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            gl.deleteShader(shader);
+            return null;
+          }
+          return shader;
+        }
+
+        function buildProgram(gl, fragSource, uniforms) {
+          const vert = compileShader(gl, gl.VERTEX_SHADER, CRT_VERT);
+          const frag = compileShader(gl, gl.FRAGMENT_SHADER, fragSource);
+          if (!vert || !frag) return null;
+
+          const program = gl.createProgram();
+          gl.attachShader(program, vert);
+          gl.attachShader(program, frag);
+          gl.linkProgram(program);
+          if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+
+          const handle = {program, position: gl.getAttribLocation(program, 'aPos')};
+          for (const name of uniforms) handle[name] = gl.getUniformLocation(program, name);
+          return handle;
+        }
+
+        function createTexture(gl, width, height, pixels) {
+          const texture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels || null);
+          return texture;
+        }
+
+        function initCrt() {
+          const options = {alpha: false, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false};
+          const gl = tube.getContext('webgl', options) || tube.getContext('experimental-webgl', options);
+          if (!gl) return;
+
+          const resolve = buildProgram(gl, RESOLVE_FRAG, ['uMainSampler', 'uSourceRes', 'uTargetRes']);
+          const glass = buildProgram(gl, CRT_FRAG, ['uMainSampler', 'uSignalRes', 'uOutputRes']);
+          if (!resolve || !glass) return;
+
+          const quad = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+          gl.bufferData(gl.ARRAY_BUFFER, QUAD, gl.STATIC_DRAW);
+
+          const source = createTexture(gl, VIEW_W, VIEW_H, null);
+          const signal = createTexture(gl, SIGNAL_W, SIGNAL_H, null);
+
+          const buffer = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, buffer);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, signal, 0);
+          const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          if (!complete) return;
+
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+          gl.disable(gl.DEPTH_TEST);
+          gl.disable(gl.BLEND);
+
+          crt.gl = gl;
+          crt.resolve = resolve;
+          crt.tube = glass;
+          crt.source = source;
+          crt.signal = signal;
+          crt.buffer = buffer;
+          crt.quad = quad;
+          crt.ready = true;
+        }
+
+        function drawQuad(gl, handle) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, crt.quad);
+          gl.enableVertexAttribArray(handle.position);
+          gl.vertexAttribPointer(handle.position, 2, gl.FLOAT, false, 0, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+
+        function presentCrt() {
+          const gl = crt.gl;
+          if (gl.isContextLost()) return;
+
+          gl.bindTexture(gl.TEXTURE_2D, crt.source);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, view);
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, crt.buffer);
+          gl.viewport(0, 0, SIGNAL_W, SIGNAL_H);
+          gl.useProgram(crt.resolve.program);
+          gl.uniform1i(crt.resolve.uMainSampler, 0);
+          gl.uniform2f(crt.resolve.uSourceRes, VIEW_W, VIEW_H);
+          gl.uniform2f(crt.resolve.uTargetRes, SIGNAL_W, SIGNAL_H);
+          drawQuad(gl, crt.resolve);
+
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.bindTexture(gl.TEXTURE_2D, crt.signal);
+          gl.viewport(0, 0, tube.width, tube.height);
+          gl.useProgram(crt.tube.program);
+          gl.uniform1i(crt.tube.uMainSampler, 0);
+          gl.uniform2f(crt.tube.uSignalRes, SIGNAL_W, SIGNAL_H);
+          gl.uniform2f(crt.tube.uOutputRes, tube.width, tube.height);
+          drawQuad(gl, crt.tube);
+        }
+
+        function setCrt(enabled) {
+          crt.enabled = enabled && crt.ready;
+          stage.classList.toggle('crt', crt.enabled);
+        }
+
+        function watchContextLoss() {
+          tube.addEventListener('webglcontextlost', (event) => {
+            event.preventDefault();
+            crt.ready = false;
+            setCrt(false);
+          });
+
+          tube.addEventListener('webglcontextrestored', () => {
+            initCrt();
+            setCrt(save.crt);
+          });
+        }
 
         let frameInterval = 0;
 
@@ -1618,6 +1930,14 @@
 
           stage.style.width = `${width}px`;
           stage.style.height = `${height}px`;
+
+          const ratio = Math.min(window.devicePixelRatio || 1, 2);
+          const pixelW = Math.max(1, Math.round(width * ratio));
+          const pixelH = Math.max(1, Math.round(height * ratio));
+          if (tube.width !== pixelW || tube.height !== pixelH) {
+            tube.width = pixelW;
+            tube.height = pixelH;
+          }
         }
 
         // Everything lands on whole pixels. A fractional edge gets antialiased
@@ -3482,7 +3802,7 @@
             await this.step('building sprites', 0.55);
             buildTextures(this.colors);
 
-            await this.step('waking the ghosts', 0.85);
+            await this.step('warming the tube', 0.85);
             await this.step('tap start to begin', 1);
 
             if (game.scene === this) this.showStart();
@@ -3500,6 +3820,16 @@
               if (isTouchDevice()) goImmersive();
               this.start('Menu');
             }, {active: true});
+
+            this.crtButton = this.button(VIEW_W / 2, this.rows[4], this.crtLabel(), () => {
+              save.crt = !save.crt;
+              setCrt(save.crt);
+              this.crtButton.setLabel(this.crtLabel());
+            }, {dim: !save.crt});
+          }
+
+          crtLabel() {
+            return `crt: ${save.crt ? 'on' : 'off'}`;
           }
 
           render() {
@@ -3746,25 +4076,37 @@
             const heights = [
               Math.round(F * 2.1),
               Math.round(F * 1.2), BTN_H,
+              Math.round(F * 1.2), BTN_H,
               BTN_H, BTN_H
             ];
             const rows = layoutColumn(PAD, VIEW_H - PAD, heights);
 
             this.titleY = rows[0];
-            this.limitY = rows[1];
+            this.crtY = rows[1];
+            this.limitY = rows[3];
+
+            this.crtButton = this.button(VIEW_W / 2, rows[2], this.crtLabel(), () => {
+              save.crt = !save.crt;
+              setCrt(save.crt);
+              this.restart();
+            }, {active: save.crt});
 
             const width = (BTN_W - PAD * 2) / 3;
             FRAME_LIMITS.forEach((option, i) => {
               const x = VIEW_W / 2 - BTN_W / 2 + width / 2 + i * (width + PAD);
-              this.button(x, rows[2], option.label, () => {
+              this.button(x, rows[4], option.label, () => {
                 setFrameLimit(option.value);
                 this.restart();
               }, {width, active: save.fpsLimit === option.value});
             });
 
-            this.fullscreenButton = this.button(VIEW_W / 2, rows[3], fullscreenLabel(), toggleFullscreen);
+            this.fullscreenButton = this.button(VIEW_W / 2, rows[5], fullscreenLabel(), toggleFullscreen);
 
-            this.button(VIEW_W / 2, rows[4], 'back', () => this.start('Menu'));
+            this.button(VIEW_W / 2, rows[6], 'back', () => this.start('Menu'));
+          }
+
+          crtLabel() {
+            return save.crt ? 'on' : 'off';
           }
 
           // requestFullscreen resolves after the click handler has returned, so
@@ -3779,6 +4121,7 @@
             label(VIEW_W / 2, this.titleY, 'KuruKuru Chase!!', {
               size: F * 2, color: this.colors.text, maxWidth: VIEW_W - PAD * 2
             });
+            label(VIEW_W / 2, this.crtY, 'crt filter', {size: Math.round(F * 0.9), color: PALETTE.dim});
             label(VIEW_W / 2, this.limitY, 'frame limit', {size: Math.round(F * 0.9), color: PALETTE.dim});
 
             this.drawWidgets();
@@ -4024,6 +4367,7 @@
           render() {
             if (!this.scene) return;
             this.scene.render();
+            if (crt.enabled) presentCrt();
           }
         };
 
@@ -4151,6 +4495,9 @@
           game.render();
         }
 
+        initCrt();
+        watchContextLoss();
+        setCrt(save.crt);
         setFrameLimit(save.fpsLimit);
         layout();
         game.start('Boot');
