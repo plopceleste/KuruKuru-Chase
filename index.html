@@ -1858,6 +1858,19 @@ void main ()
           stage.classList.toggle('crt', crt.enabled);
         }
 
+        function watchContextLoss() {
+          tube.addEventListener('webglcontextlost', (event) => {
+            event.preventDefault();
+            crt.ready = false;
+            setCrt(false);
+          });
+
+          tube.addEventListener('webglcontextrestored', () => {
+            initCrt();
+            setCrt(save.crt);
+          });
+        }
+
         let frameInterval = 0;
 
         function setFrameLimit(fps) {
@@ -2092,6 +2105,8 @@ void main ()
 
           clearInput() {}
 
+          fullscreenChanged() {}
+
           destroy() {}
 
           start(name) {
@@ -2121,7 +2136,6 @@ void main ()
             this.seedText = '';
             this.seed = '';
             this.rng = Math.random;
-            this.chance = Math.random;
             this.reset();
           }
 
@@ -2150,12 +2164,18 @@ void main ()
             this.seed = this.randomSeed
               ? Math.random().toString(36).slice(2, 8)
               : (this.seedText || 'maze');
-            // `rng` only ever feeds floor layout and card drafts. Per-frame rolls
-            // go through `chance`, so a seed reproduces the same floors no matter
-            // how many decisions the ghosts happened to make on the way there.
+            // `rng` is the live-play stream: ghost decisions and lucky rolls,
+            // consumed at a rate set by frame timing. Anything that has to be
+            // reproducible from the seed uses floorRng instead.
             this.rng = seededRandom(this.seed);
-            this.chance = seededRandom(`${this.seed}#chance`);
             this.startTime = Date.now();
+          }
+
+          // Generation must not ride the gameplay stream: ghost decisions and
+          // lucky rolls consume run.rng, so a shared stream would make every
+          // floor past the first depend on how the previous ones were played.
+          floorRng(tag) {
+            return seededRandom(`${this.seed}/${tag}/${this.floor}`);
           }
 
           bankFloor() {
@@ -2181,11 +2201,12 @@ void main ()
               return 52;
             };
 
+            const rng = this.floorRng('draft');
             const picks = [];
             while (picks.length < 3 && pool.length > 0) {
               let total = 0;
               for (const key of pool) total += weight(key);
-              let roll = this.rng() * total;
+              let roll = rng() * total;
               let index = pool.length - 1;
               for (let i = 0; i < pool.length; i++) {
                 roll -= weight(pool[i]);
@@ -2532,8 +2553,6 @@ void main ()
               if (this.dir.x !== 0 || this.dir.y !== 0) {
                 this.tx += this.dir.x * remaining;
                 this.ty += this.dir.y * remaining;
-                this.nextTile.x = Math.round(this.tx) + this.dir.x;
-                this.nextTile.y = Math.round(this.ty) + this.dir.y;
               }
             }
 
@@ -2627,7 +2646,7 @@ void main ()
 
           decideNext() {
             const maze = this.gs.maze;
-            const rng = run.chance;
+            const rng = run.rng;
             const player = this.gs.player;
             const cx = Math.round(this.tx);
             const cy = Math.round(this.ty);
@@ -2966,7 +2985,7 @@ void main ()
             this.shakeIntensity = 0;
             this.bannerStart = clock;
 
-            const floor = generateFloor(run.floor, run.rng, run.stats.quotaRate);
+            const floor = generateFloor(run.floor, run.floorRng('floor'), run.stats.quotaRate);
             this.maze = floor.maze;
             this.gate = floor.gate;
             this.totalCoins = floor.totalCoins;
@@ -3116,8 +3135,10 @@ void main ()
           }
 
           shake(duration, intensity) {
+            this.shakeIntensity = this.shakeLeft > 0
+              ? Math.max(this.shakeIntensity, intensity)
+              : intensity;
             this.shakeLeft = Math.max(this.shakeLeft, duration / 1000);
-            this.shakeIntensity = intensity;
           }
 
           popup(text, tileX, tileY, color) {
@@ -3195,7 +3216,7 @@ void main ()
             if (this.gate.open) pay *= stats.overtimeRate;
             pay = Math.floor(pay * (1 + run.streak * 0.02));
 
-            if (stats.lucky > 0 && run.chance() < stats.lucky) {
+            if (stats.lucky > 0 && run.rng() < stats.lucky) {
               pay *= 5;
               this.popup('5x', coin.tileX, coin.tileY, PALETTE.gold);
             }
@@ -3628,7 +3649,12 @@ void main ()
             this.rows = layoutColumn(PAD, VIEW_H - PAD, rows);
             this.progress = 0;
             this.status = 'starting';
-            this.boot();
+            this.boot().catch((error) => {
+              console.error(error);
+              this.status = 'boot failed - tap start';
+              this.progress = 1;
+              if (game.scene === this) this.showStart();
+            });
           }
 
           async boot() {
@@ -3950,14 +3976,14 @@ void main ()
             this.button(VIEW_W / 2, rows[6], 'back', () => this.start('Menu'));
           }
 
-          update() {
-            // requestFullscreen resolves asynchronously, so reading the label
-            // right after the click always reports the state we just left.
-            this.fullscreenButton.setLabel(fullscreenLabel());
-          }
-
           crtLabel() {
             return save.crt ? 'on' : 'off';
+          }
+
+          // requestFullscreen resolves after the click handler has returned, so
+          // the label can only be trusted once the browser reports the change.
+          fullscreenChanged() {
+            if (this.fullscreenButton) this.fullscreenButton.setLabel(fullscreenLabel());
           }
 
           render() {
@@ -4225,27 +4251,26 @@ void main ()
           };
         }
 
-        // These all return promises that reject on unsupported platforms
-        // (orientation.lock on desktop and iOS especially), and a synchronous
-        // try/catch never sees those: swallow them explicitly.
-        const shrug = () => {};
-
-        function goImmersive() {
+        // Both of these reject asynchronously, so a synchronous try/catch would
+        // never see the failure. The lock also has to wait for the element to
+        // actually be fullscreen or Android rejects it outright.
+        async function goImmersive() {
           try {
-            if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(shrug);
-            if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(shrug);
+            if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
           } catch {
             return;
           }
+
+          try {
+            if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape');
+          } catch {}
         }
 
-        function toggleFullscreen() {
+        async function toggleFullscreen() {
           try {
-            if (document.fullscreenElement) document.exitFullscreen().catch(shrug);
-            else document.documentElement.requestFullscreen().catch(shrug);
-          } catch {
-            return;
-          }
+            if (document.fullscreenElement) await document.exitFullscreen();
+            else await document.documentElement.requestFullscreen();
+          } catch {}
         }
 
         function fullscreenLabel() {
@@ -4279,8 +4304,14 @@ void main ()
           game.scene.pointerUp(point.x, point.y);
         };
 
+        // A cancelled pointer is an aborted gesture, not a tap: routing it
+        // through pointerUp would fire the widget click sitting under the finger.
+        const cancelPointer = () => {
+          if (game.scene) game.scene.clearInput();
+        };
+
         stage.addEventListener('pointerup', releasePointer);
-        stage.addEventListener('pointercancel', releasePointer);
+        stage.addEventListener('pointercancel', cancelPointer);
 
         window.addEventListener('keydown', (event) => {
           if (HELD_KEYS.has(event.code)) event.preventDefault();
@@ -4303,7 +4334,10 @@ void main ()
 
         window.addEventListener('resize', layout);
         window.addEventListener('orientationchange', layout);
-        document.addEventListener('fullscreenchange', layout);
+        document.addEventListener('fullscreenchange', () => {
+          layout();
+          if (game.scene) game.scene.fullscreenChanged();
+        });
 
         let lastFrame = 0;
 
@@ -4320,21 +4354,8 @@ void main ()
           game.render();
         }
 
-        // Without this the tube keeps its `visibility: visible` while presentCrt
-        // bails out, and #view stays hidden behind it: a permanently black screen.
-        tube.addEventListener('webglcontextlost', (event) => {
-          event.preventDefault();
-          crt.ready = false;
-          setCrt(false);
-        });
-
-        tube.addEventListener('webglcontextrestored', () => {
-          crt.ready = false;
-          initCrt();
-          setCrt(save.crt);
-        });
-
         initCrt();
+        watchContextLoss();
         setCrt(save.crt);
         setFrameLimit(save.fpsLimit);
         layout();
