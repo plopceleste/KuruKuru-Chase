@@ -559,9 +559,13 @@
             }
           }
 
-          const start = empties[Math.floor(rng() * empties.length)];
+          // Punching EXTRA_HOLES can strand a cell with four walls around it.
+          // Start inside the carved component so the floor is always playable.
+          const carved = floodFill(maze, {x: 1, y: 1});
+          const reachable = empties.filter((p) => carved[p.y * MAZE_W + p.x] >= 0);
+
+          const start = reachable[Math.floor(rng() * reachable.length)];
           const dist = floodFill(maze, start);
-          const reachable = empties.filter((p) => dist[p.y * MAZE_W + p.x] >= 0);
 
           let gate = start;
           let gateDist = -1;
@@ -1226,6 +1230,7 @@
         const CHOMP_FPS = 19;
 
         const WARDEN_SIZE = 24;
+        const COIN_SIZE = 3;
         const ORB_CELL = 9;
         const ANCHOR_SIZE = 14;
         const BAIT_SIZE = 12;
@@ -1298,6 +1303,27 @@
               }
             }
           }
+        }
+
+        const DITHER_PANELS = new Map();
+
+        // Rasterising a card-sized dither is ~900 fillRects; cache the pattern so
+        // it costs one drawImage per frame instead.
+        function ditherPanel(width, height, color, cell) {
+          const key = `${width}|${height}|${color}|${cell}`;
+          let panel = DITHER_PANELS.get(key);
+          if (panel) return panel;
+
+          panel = document.createElement('canvas');
+          panel.width = Math.max(1, width);
+          panel.height = Math.max(1, height);
+          const target = panel.getContext('2d');
+          target.imageSmoothingEnabled = false;
+          dither(target, 0, 0, panel.width, panel.height, color, cell);
+
+          if (DITHER_PANELS.size > 48) DITHER_PANELS.clear();
+          DITHER_PANELS.set(key, panel);
+          return panel;
         }
 
         function wallTile(target, x, y, size, color) {
@@ -1431,19 +1457,14 @@
         }
 
         function buildTextures(colors) {
-          bake('coin', 3, 3, (target) => {
-            target.fillStyle = colors.pellet;
-            target.fillRect(0, 0, 3, 3);
-          });
-
           bake('orb', ORB_CELL * 2, ORB_CELL, (target, tex) => {
             [7, 9].forEach((size, i) => {
-              const cx = i * ORB_CELL + ORB_CELL / 2;
-              const cy = ORB_CELL / 2;
-              const half = Math.round(size / 2);
+              const inset = Math.floor((ORB_CELL - size) / 2);
+              const x = i * ORB_CELL + inset;
+              const y = inset;
               target.fillStyle = colors.power;
-              target.fillRect(cx - half, cy - half + 1, size, size - 2);
-              target.fillRect(cx - half + 1, cy - half, size - 2, size);
+              target.fillRect(x, y + 1, size, size - 2);
+              target.fillRect(x + 1, y, size - 2, size);
             });
             frame(tex, 'small', 0, 0, ORB_CELL, ORB_CELL);
             frame(tex, 'big', ORB_CELL, 0, ORB_CELL, ORB_CELL);
@@ -2143,6 +2164,9 @@ void main ()
             this.seed = this.randomSeed
               ? Math.random().toString(36).slice(2, 8)
               : (this.seedText || 'maze');
+            // `rng` is the live-play stream: ghost decisions and lucky rolls,
+            // consumed at a rate set by frame timing. Anything that has to be
+            // reproducible from the seed uses floorRng instead.
             this.rng = seededRandom(this.seed);
             this.startTime = Date.now();
           }
@@ -2283,6 +2307,7 @@ void main ()
         const DASH_INVULN = 0.5;
         const HIT_INVULN = 1.5;
         const DASH_STUN_RADIUS_SQ = 0.64;
+        const WALL_ESCAPE = 0.05;
 
         class Player {
           constructor(scene, tileX, tileY) {
@@ -2364,6 +2389,9 @@ void main ()
             if (this.intangible > 0) this.intangible -= dt;
 
             const tile = this.gs.tileAt(Math.round(this.tx), Math.round(this.ty));
+            // Losing intangibility inside a wall would wedge the player forever:
+            // every neighbour is solid, so no direction is ever accepted again.
+            if (this.intangible <= 0 && tile === WALL) this.intangible = WALL_ESCAPE;
             this.step(BASE_SPEED * this.stats.speed * this.gs.terrainFactor(tile) * dt);
             this.syncPosition();
             this.updateVisuals(dt);
@@ -2785,12 +2813,12 @@ void main ()
             }
             if (insideZone(ZONES.dash, x, y)) {
               this.pointers.set(id, 'action');
-              this.scene.player.dash();
+              if (!this.scene.paused) this.scene.player.dash();
               return;
             }
             if (insideZone(ZONES.item, x, y)) {
               this.pointers.set(id, 'action');
-              this.scene.useActive();
+              if (!this.scene.paused) this.scene.useActive();
               return;
             }
             this.pointers.set(id, 'swipe');
@@ -3457,8 +3485,15 @@ void main ()
 
             ctx.drawImage(TEX.maze.canvas, 0, 0);
 
+            // Coins are the hottest draw in the frame and every one is the same
+            // flat 3px square, so fill them directly instead of blitting a sprite.
+            ctx.fillStyle = colors.pellet;
             for (const coin of this.coins) {
-              drawSprite(TEX.coin, null, coin.tileX * TILE + TILE / 2, coin.tileY * TILE + TILE / 2);
+              ctx.fillRect(
+                Math.round(coin.tileX * TILE + TILE / 2 - COIN_SIZE / 2),
+                Math.round(coin.tileY * TILE + TILE / 2 - COIN_SIZE / 2),
+                COIN_SIZE, COIN_SIZE
+              );
             }
 
             const bigOrb = Math.floor(clock / ORB_PULSE_MS) % 2 === 1;
@@ -4010,13 +4045,9 @@ void main ()
 
             fillRect(this.x, this.y, this.w, this.h, this.hot ? PALETTE.slate : PALETTE.ink, this.hot ? 0.55 : 0.85);
 
-            ctx.save();
-            ctx.beginPath();
-            ctx.rect(this.x + 2, this.y + 2, this.w - 4, this.h - 4);
-            ctx.clip();
             ctx.globalAlpha = eased * 0.12;
-            dither(ctx, this.x + 2, this.y + 2, this.w - 4, this.h - 4, this.rarity, DITHER_CELL);
-            ctx.restore();
+            ctx.drawImage(ditherPanel(this.w - 4, this.h - 4, this.rarity, DITHER_CELL), this.x + 2, this.y + 2);
+            ctx.globalAlpha = eased;
 
             strokeRect(this.x, this.y, this.w, this.h, border);
 
@@ -4293,6 +4324,12 @@ void main ()
 
         window.addEventListener('blur', () => {
           if (game.scene) game.scene.clearInput();
+        });
+
+        // Backgrounding a mobile browser does not reliably fire `blur`, and a
+        // latched direction would still be steering when the player comes back.
+        document.addEventListener('visibilitychange', () => {
+          if (document.hidden && game.scene) game.scene.clearInput();
         });
 
         window.addEventListener('resize', layout);
